@@ -123,6 +123,232 @@ fn foreground_changes_only_enumerate_affected_directories() {
     assert_eq!(changed.report.counters.files_statted, 2);
 }
 
+#[test]
+fn targeted_refresh_updates_only_the_selected_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir_all(root.join("a/deep")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("a/first"), b"one").unwrap();
+    fs::write(root.join("a/deep/leaf"), b"leaf").unwrap();
+    fs::write(root.join("b/first"), b"two").unwrap();
+    let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
+    let initial = fast::scan(
+        cache.clone(),
+        &quick(),
+        2,
+        Arc::new(Progress::default()),
+        None,
+    )
+    .unwrap();
+    let root_snapshot = initial
+        .tree
+        .snapshot(ROOT, &ListOptions::default())
+        .unwrap();
+    let a = root_snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "a")
+        .unwrap()
+        .id;
+    let b = root_snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "b")
+        .unwrap()
+        .id;
+    drop(initial);
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs::write(root.join("a/new"), b"targeted").unwrap();
+    fs::write(root.join("b/new"), b"outside").unwrap();
+    let targeted = fast::scan_subtree(
+        cache.clone(),
+        &root.join("a"),
+        &quick(),
+        2,
+        Arc::new(Progress::default()),
+    )
+    .unwrap();
+    assert_eq!(targeted.scope, a);
+    assert_eq!(targeted.report.mode, "targeted");
+    assert_eq!(targeted.report.counters.directories_checked, 2);
+    assert_eq!(targeted.report.counters.directories_enumerated, 1);
+    assert!(
+        targeted
+            .tree
+            .snapshot(a, &ListOptions::default())
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "new")
+    );
+    assert!(
+        targeted
+            .tree
+            .snapshot(b, &ListOptions::default())
+            .unwrap()
+            .entries
+            .iter()
+            .all(|entry| entry.name != "new")
+    );
+    drop(targeted);
+
+    let resumed = fast::scan(cache, &quick(), 2, Arc::new(Progress::default()), None).unwrap();
+    assert!(
+        resumed
+            .tree
+            .snapshot(b, &ListOptions::default())
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "new")
+    );
+    assert_usage(&resumed.tree);
+}
+
+#[test]
+fn targeted_refresh_relinks_a_directory_moved_into_the_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir_all(root.join("a/moved")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("a/moved/file"), b"contents").unwrap();
+    let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
+    let initial = fast::scan(
+        cache.clone(),
+        &quick(),
+        2,
+        Arc::new(Progress::default()),
+        None,
+    )
+    .unwrap();
+    let root_snapshot = initial
+        .tree
+        .snapshot(ROOT, &ListOptions::default())
+        .unwrap();
+    let a = root_snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "a")
+        .unwrap()
+        .id;
+    let b = root_snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "b")
+        .unwrap()
+        .id;
+    let moved = initial
+        .tree
+        .snapshot(a, &ListOptions::default())
+        .unwrap()
+        .entries[0]
+        .id;
+    drop(initial);
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs::rename(root.join("a/moved"), root.join("b/moved")).unwrap();
+    let targeted = fast::scan_subtree(
+        cache,
+        &root.join("b"),
+        &quick(),
+        2,
+        Arc::new(Progress::default()),
+    )
+    .unwrap();
+    assert!(
+        targeted
+            .tree
+            .snapshot(a, &ListOptions::default())
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let moved_entry = targeted
+        .tree
+        .snapshot(b, &ListOptions::default())
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.name == "moved")
+        .unwrap();
+    assert_eq!(moved_entry.id, moved);
+    assert_usage(&targeted.tree);
+}
+
+#[test]
+fn targeted_exact_refresh_does_not_stat_files_outside_the_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("a/file"), b"a").unwrap();
+    fs::write(root.join("b/file"), b"b").unwrap();
+    let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
+    drop(
+        fast::scan(
+            cache.clone(),
+            &quick(),
+            2,
+            Arc::new(Progress::default()),
+            None,
+        )
+        .unwrap(),
+    );
+    fs::write(root.join("a/file"), [1; 2000]).unwrap();
+    fs::write(root.join("b/file"), [2; 3000]).unwrap();
+
+    let targeted = fast::scan_subtree(
+        cache,
+        &root.join("a"),
+        &Options {
+            exact: true,
+            ..quick()
+        },
+        2,
+        Arc::new(Progress::default()),
+    )
+    .unwrap();
+    let root_snapshot = targeted
+        .tree
+        .snapshot(ROOT, &ListOptions::default())
+        .unwrap();
+    let a = root_snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "a")
+        .unwrap()
+        .id;
+    let b = root_snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "b")
+        .unwrap()
+        .id;
+    assert_eq!(targeted.report.counters.files_statted, 1);
+    assert_eq!(
+        targeted
+            .tree
+            .snapshot(a, &ListOptions::default())
+            .unwrap()
+            .entries[0]
+            .totals
+            .apparent_bytes,
+        2000
+    );
+    assert_eq!(
+        targeted
+            .tree
+            .snapshot(b, &ListOptions::default())
+            .unwrap()
+            .entries[0]
+            .totals
+            .apparent_bytes,
+        1
+    );
+}
+
 fn assert_usage(tree: &fast::Tree) {
     let snapshot = tree.snapshot(ROOT, &ListOptions::default()).unwrap();
     for (apparent, size) in [

@@ -1,6 +1,17 @@
 use super::*;
-use crate::{fast, scan};
+use crate::{estimate::AuditOptions, fast, scan};
 use std::fs;
+
+fn quick() -> scan::Options {
+    scan::Options {
+        audit: AuditOptions {
+            sample: 0,
+            priority: 0,
+            ..AuditOptions::default()
+        },
+        ..scan::Options::default()
+    }
+}
 
 #[test]
 fn interrupted_indexing_resumes_after_its_last_committed_batch() {
@@ -10,6 +21,7 @@ fn interrupted_indexing_resumes_after_its_last_committed_batch() {
     for at in 0..700 {
         fs::write(root.join(format!("file-{at}")), b"contents").unwrap();
     }
+
     let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
     let scanned = fast::scan(
         cache.clone(),
@@ -68,4 +80,55 @@ fn interrupted_indexing_resumes_after_its_last_committed_batch() {
     assert!(unchanged.complete);
     assert_eq!(unchanged.rows_written, 0);
     assert_eq!(unchanged.resumed_rows, 700);
+}
+
+#[test]
+fn targeted_refresh_reindexes_only_changed_directories_and_ancestors() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("a/old"), b"a").unwrap();
+    fs::write(root.join("b/old"), b"b").unwrap();
+    let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
+    let initial = fast::scan(
+        cache.clone(),
+        &quick(),
+        2,
+        Arc::new(scan::Progress::default()),
+        None,
+    )
+    .unwrap();
+    let first = run(
+        &cache,
+        &initial.tree,
+        initial.lock.clone(),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Progress::default()),
+    )
+    .unwrap();
+    assert_eq!(first.rows_written, 4);
+    drop(initial);
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs::write(root.join("a/new"), b"new").unwrap();
+    let targeted = fast::scan_subtree(
+        cache.clone(),
+        &root.join("a"),
+        &quick(),
+        2,
+        Arc::new(scan::Progress::default()),
+    )
+    .unwrap();
+    let refreshed = run(
+        &cache,
+        &targeted.tree,
+        targeted.lock,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Progress::default()),
+    )
+    .unwrap();
+    assert!(refreshed.complete);
+    assert_eq!(refreshed.rows_written, 4);
+    assert_eq!(refreshed.resumed_rows, 1);
 }

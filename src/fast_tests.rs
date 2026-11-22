@@ -1,4 +1,5 @@
 use super::*;
+use std::fs::File;
 
 fn quick() -> ScanOptions {
     ScanOptions {
@@ -78,6 +79,82 @@ fn partial_directory_checkpoints_resume_without_restatting_saved_files() {
     let sizes = resumed.report.totals;
     drop(resumed);
     assert_eq!(cached(&cache).unwrap().dir(1).unwrap().totals, sizes);
+}
+
+#[test]
+fn targeted_refresh_can_preempt_and_then_resume_a_partial_exact_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("a/file"), b"a").unwrap();
+    fs::write(root.join("b/file"), b"b").unwrap();
+    let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
+    let lock = cache.lock().unwrap();
+    let loaded = journal::load(&cache).unwrap();
+    let mut log = Journal::open(&cache, &loaded).unwrap();
+    let mut tree = loaded.tree;
+    let info = Info::from(&fs::symlink_metadata(&root).unwrap());
+    append(
+        &mut tree,
+        &mut log,
+        Event::Start {
+            root: root.as_os_str().as_bytes().to_vec(),
+            info,
+        },
+    )
+    .unwrap();
+    append(&mut tree, &mut log, Event::Begin { directory: 1, info }).unwrap();
+    drop(log);
+    drop(lock);
+
+    let targeted = scan_subtree(
+        cache.clone(),
+        &root.join("b"),
+        &ScanOptions {
+            exact: true,
+            ..quick()
+        },
+        1,
+        Arc::new(Progress::default()),
+    )
+    .unwrap();
+    assert_eq!(targeted.report.mode, "targeted_full");
+    assert!(!targeted.report.complete);
+    assert_eq!(targeted.report.counters.files_statted, 1);
+    assert_eq!(
+        targeted
+            .tree
+            .snapshot(targeted.scope, &ListOptions::default())
+            .unwrap()
+            .entries[0]
+            .name,
+        "file"
+    );
+    drop(targeted);
+
+    let resumed = scan(
+        cache,
+        &ScanOptions {
+            exact: true,
+            ..quick()
+        },
+        1,
+        Arc::new(Progress::default()),
+        None,
+    )
+    .unwrap();
+    assert!(resumed.resumed);
+    assert!(resumed.report.complete);
+    assert_eq!(
+        resumed
+            .tree
+            .snapshot(ROOT, &ListOptions::default())
+            .unwrap()
+            .children,
+        2
+    );
+    assert!(resumed.report.counters.reused_directories >= 1);
 }
 
 #[test]

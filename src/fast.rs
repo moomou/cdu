@@ -1,6 +1,6 @@
 use crate::{
     ListOptions, Snapshot, Sort,
-    cache::Cache,
+    cache::{Cache, CacheLock},
     estimate::{self, AuditOptions, Samples},
     journal::{self, Journal},
     model::{
@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, atomic::Ordering},
     thread,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -72,6 +72,11 @@ pub(crate) enum Event {
         flags: u8,
     },
     Report(Box<Report>),
+    Remove {
+        directory: u32,
+        entry: u32,
+        child: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +121,34 @@ impl Directory {
             .checked_sub(1)?;
         let chunk = &self.chunks[chunk];
         chunk.entries.get(index - chunk.start as usize)
+    }
+
+    fn remove(&mut self, index: usize, child: u32) -> Result<()> {
+        let mut entries: Vec<_> = self.entries().cloned().collect();
+        ensure!(
+            entries
+                .get(index)
+                .is_some_and(|entry| entry.directory == child),
+            "invalid checkpoint directory removal"
+        );
+        entries.remove(index);
+        self.chunks = entries
+            .chunks(CHUNK)
+            .enumerate()
+            .map(|(chunk, entries)| {
+                Arc::new(Chunk {
+                    start: (chunk * CHUNK) as u32,
+                    entries: entries.to_vec().into_boxed_slice(),
+                })
+            })
+            .collect();
+        self.entries_count = entries.len();
+        if self.counted.len() > index {
+            self.counted.remove(index);
+        } else {
+            self.counted.clear();
+        }
+        Ok(())
     }
 }
 
@@ -247,6 +280,15 @@ impl Tree {
                 dir.revision = sequence;
             }
             Event::Report(report) => self.report = Some((**report).clone()),
+            Event::Remove {
+                directory,
+                entry,
+                child,
+            } => {
+                let dir = self.dir_mut(*directory)?;
+                dir.remove(*entry as usize, *child)?;
+                dir.revision = sequence;
+            }
         }
         Ok(())
     }
@@ -264,6 +306,42 @@ impl Tree {
             path.push(OsStr::from_bytes(part));
         }
         Ok(path)
+    }
+
+    pub(crate) fn directory_at_path(&self, path: &Path) -> Result<Id> {
+        let relative = path
+            .strip_prefix(&self.root)
+            .context("directory path escaped the scan root")?;
+        let mut directory = ROOT as u32;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                ensure!(
+                    matches!(component, Component::CurDir),
+                    "invalid directory path"
+                );
+                continue;
+            };
+            directory = self
+                .dir(directory)?
+                .entries()
+                .find(|entry| {
+                    entry.name.as_ref() == name.as_bytes()
+                        && entry.directory != 0
+                        && entry.flags & EXCLUDED == 0
+                })
+                .map(|entry| entry.directory)
+                .context("directory is no longer in the scan")?;
+        }
+        Ok(directory as Id)
+    }
+
+    fn directory_link(&self, child: u32) -> Option<(u32, usize)> {
+        let parent = self.dir(child).ok()?.parent;
+        self.dir(parent)
+            .ok()?
+            .entries()
+            .position(|entry| entry.directory == child)
+            .map(|entry| (parent, entry))
     }
 
     pub fn is_complete(&self) -> bool {
@@ -581,8 +659,9 @@ enum Found {
 pub struct ScanResult {
     pub tree: Arc<Tree>,
     pub report: Report,
-    pub lock: Arc<File>,
+    pub lock: Arc<CacheLock>,
     pub resumed: bool,
+    pub scope: Id,
 }
 
 pub fn cached(cache: &Cache) -> Result<Arc<Tree>> {
@@ -786,12 +865,52 @@ fn children(tree: &Tree, id: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+enum RequestedScope {
+    Root,
+    Subtree(PathBuf),
+}
+
 pub fn scan(
+    cache: Cache,
+    options: &ScanOptions,
+    threads: usize,
+    progress: Arc<Progress>,
+    preview: Option<Sender<Arc<Tree>>>,
+) -> Result<ScanResult> {
+    scan_scope(
+        cache,
+        options,
+        threads,
+        progress,
+        preview,
+        RequestedScope::Root,
+    )
+}
+
+pub fn scan_subtree(
+    cache: Cache,
+    target: &Path,
+    options: &ScanOptions,
+    threads: usize,
+    progress: Arc<Progress>,
+) -> Result<ScanResult> {
+    scan_scope(
+        cache,
+        options,
+        threads,
+        progress,
+        None,
+        RequestedScope::Subtree(target.to_path_buf()),
+    )
+}
+
+fn scan_scope(
     mut cache: Cache,
     options: &ScanOptions,
     threads: usize,
     progress: Arc<Progress>,
     preview: Option<Sender<Arc<Tree>>>,
+    requested: RequestedScope,
 ) -> Result<ScanResult> {
     ensure!(
         (1..=8).contains(&threads),
@@ -819,10 +938,22 @@ pub fn scan(
         !cache.root.starts_with(&cache.base),
         "cannot scan cdu's cache"
     );
-    let full = (options.exact && was_complete)
-        || !had_cache
-        || loaded.tree.dir(ROOT as u32)?.info.identity != root_info.identity;
-    let resumed = had_cache && !was_complete && !full;
+    let targeted = matches!(&requested, RequestedScope::Subtree(_));
+    if targeted {
+        ensure!(
+            had_cache,
+            "no checkpointed tree exists for a targeted refresh"
+        );
+        ensure!(
+            loaded.tree.dir(ROOT as u32)?.info.identity == root_info.identity,
+            "scan root was replaced; resume the root refresh first"
+        );
+    }
+    let full = !targeted
+        && ((options.exact && was_complete)
+            || !had_cache
+            || loaded.tree.dir(ROOT as u32)?.info.identity != root_info.identity);
+    let resumed = !targeted && had_cache && !was_complete && !full;
     let mut journal = Journal::open(&cache, &loaded)?;
     let mut tree = loaded.tree;
     if full {
@@ -839,7 +970,20 @@ pub fn scan(
         metadata_calls: 1,
         ..Counters::default()
     };
-    progress.partial.store(full || resumed, Ordering::Relaxed);
+    let scan_root = match requested {
+        RequestedScope::Root => ROOT as u32,
+        RequestedScope::Subtree(path) => resolve_scope(
+            &cache,
+            &mut tree,
+            &mut journal,
+            &path,
+            root_info,
+            &mut counters,
+        )?,
+    };
+    progress
+        .partial
+        .store(full || resumed || targeted, Ordering::Relaxed);
     progress.size_ready.store(true, Ordering::Release);
     let mut live_disk = if full {
         root_info.disk()
@@ -862,12 +1006,14 @@ pub fn scan(
     let cache_inside_root = cache.base.starts_with(&cache.root);
     let (work_send, work_receive) = crossbeam_channel::bounded::<Work>(threads * 2);
     let (result_send, result_receive) = crossbeam_channel::bounded::<Found>(threads * 8);
-    let mut todo = VecDeque::from([ROOT as u32]);
+    let mut todo = VecDeque::from([scan_root]);
     let mut status = vec![0u8; tree.directories.len()];
     let mut attempts = vec![0u8; tree.directories.len()];
-    status[ROOT as usize] = 1;
+    status[scan_root as usize] = 1;
     let mut active = 0usize;
     let mut settled = true;
+    let force = options.exact && (targeted || !resumed);
+    let mut observed_files = HashMap::new();
     let before_sequence = journal.sequence;
     thread::scope(|scope| -> Result<()> {
         for _ in 0..threads {
@@ -904,7 +1050,7 @@ pub fn scan(
                         path: tree.path(id)?,
                         info: dir.info,
                         cached,
-                        force: options.exact && !resumed,
+                        force,
                     };
                     counters.metadata_calls += u64::from(work.cached.is_some());
                     sender.as_ref().unwrap().send(work)?;
@@ -946,6 +1092,7 @@ pub fn scan(
                     Found::Entries(id, mut entries) => {
                         let mut parent_path = None;
                         let mut next = tree.directories.len() as u32;
+                        let mut claimed_directories = HashSet::new();
                         for entry in &mut entries {
                             counters.metadata_calls += 1;
                             if entry.info.kind != Kind::Directory {
@@ -995,6 +1142,17 @@ pub fn scan(
                                         {
                                             entry.flags |= EXCLUDED;
                                         } else {
+                                            if let Some((parent, at)) = tree.directory_link(old) {
+                                                append(
+                                                    &mut tree,
+                                                    &mut journal,
+                                                    Event::Remove {
+                                                        directory: parent,
+                                                        entry: at as u32,
+                                                        child: old,
+                                                    },
+                                                )?;
+                                            }
                                             entry.directory = old;
                                         }
                                     } else {
@@ -1003,6 +1161,14 @@ pub fn scan(
                                         known_dirs.insert(entry.info.identity, entry.directory);
                                     }
                                 }
+                                if entry.directory != 0
+                                    && !claimed_directories.insert(entry.directory)
+                                {
+                                    entry.flags |= EXCLUDED;
+                                    entry.directory = 0;
+                                }
+                            } else if entry.flags & (EXCLUDED | UNREADABLE) == 0 {
+                                observed_files.insert(entry.info.identity, entry.info);
                             }
                             if full && entry.flags & EXCLUDED == 0 {
                                 let count = entry.info.kind == Kind::Directory
@@ -1122,28 +1288,50 @@ pub fn scan(
         result
     })?;
     tree.aggregate()?;
+    if !observed_files.is_empty() {
+        propagate_file_info(&mut tree, &mut journal, &observed_files)?;
+        tree.aggregate()?;
+    }
     let cancelled = progress.cancel.load(Ordering::Relaxed);
     let mut audit = None;
-    if !full && !cancelled {
-        audit = Some(audit_files(
+    let mut valid_audit = true;
+    if !(full || cancelled || targeted && options.exact) {
+        let scoped = audit_files(
             &mut tree,
             &mut journal,
             &options.audit,
             &mut counters,
             &progress,
-        )?);
+            scan_root,
+        )?;
+        valid_audit = scoped.status != "incomplete";
+        if !targeted {
+            audit = Some(scoped);
+        }
     }
     let total = tree.dir(ROOT as u32)?.totals;
-    let valid_audit = audit
-        .as_ref()
-        .is_none_or(|audit| audit.status != "incomplete");
     counters.walk_us = started.elapsed().as_micros() as u64;
     counters.elapsed_us = counters.walk_us;
     counters.checkpoint_records = journal.sequence - before_sequence;
     let report = Report {
         index_generation: journal.sequence,
-        mode: if full { "full" } else { "incremental" }.to_owned(),
-        reason: if resumed {
+        mode: if targeted {
+            if options.exact {
+                "targeted_full"
+            } else {
+                "targeted"
+            }
+        } else if full {
+            "full"
+        } else {
+            "incremental"
+        }
+        .to_owned(),
+        reason: if targeted && options.exact {
+            "targeted full metadata scan"
+        } else if targeted {
+            "targeted directory validation and file audit"
+        } else if resumed {
             "resuming checkpointed scan"
         } else if full {
             "parallel full metadata scan"
@@ -1159,10 +1347,15 @@ pub fn scan(
         audit,
         warning: if cancelled {
             Some("Paused; scan checkpoints will resume next time.".to_owned())
-        } else if !full {
-            Some("Cached file sizes may be stale; file-audit bounds remain conditional.".to_owned())
         } else if total.errors > 0 {
             Some("Some metadata was unreadable; totals are incomplete.".to_owned())
+        } else if targeted {
+            Some(
+                "Only the selected subtree was refreshed; other cached directories were not validated."
+                    .to_owned(),
+            )
+        } else if !full {
+            Some("Cached file sizes may be stale; file-audit bounds remain conditional.".to_owned())
         } else {
             None
         },
@@ -1183,7 +1376,172 @@ pub fn scan(
         report,
         lock,
         resumed,
+        scope: scan_root as Id,
     })
+}
+
+fn resolve_scope(
+    cache: &Cache,
+    tree: &mut Tree,
+    journal: &mut Journal,
+    target: &Path,
+    root_info: Info,
+    counters: &mut Counters,
+) -> Result<u32> {
+    let relative = target
+        .strip_prefix(&cache.root)
+        .context("targeted refresh escaped the scan root")?;
+    let mut directory = ROOT as u32;
+    let mut path = cache.root.clone();
+    let mut filesystems = HashMap::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            ensure!(
+                matches!(component, Component::CurDir),
+                "invalid targeted refresh path"
+            );
+            continue;
+        };
+        path.push(name);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("reading targeted directory {}", path.display()))?;
+        counters.metadata_calls += 1;
+        let info = Info::from(&metadata);
+        ensure!(
+            info.kind == Kind::Directory,
+            "targeted refresh path is no longer a directory"
+        );
+        ensure!(
+            !cache.one_file_system || info.identity.device == root_info.identity.device,
+            "targeted refresh path is on an excluded filesystem"
+        );
+        ensure!(
+            !path.starts_with(&cache.base)
+                && !excluded_filesystem(&path, info.identity.device, &mut filesystems),
+            "targeted refresh path is excluded"
+        );
+
+        let existing = tree
+            .dir(directory)?
+            .entries()
+            .enumerate()
+            .find(|(_, entry)| entry.name.as_ref() == name.as_bytes())
+            .map(|(at, entry)| (at, entry.clone()));
+        if let Some((at, entry)) = existing {
+            ensure!(
+                entry.info.kind == Kind::Directory
+                    && entry.directory != 0
+                    && entry.flags & EXCLUDED == 0,
+                "targeted refresh path is no longer navigable"
+            );
+            if entry.info != info || entry.flags & UNREADABLE != 0 {
+                append(
+                    tree,
+                    journal,
+                    Event::Patch {
+                        directory,
+                        entry: at as u32,
+                        info,
+                        flags: entry.flags & !UNREADABLE,
+                    },
+                )?;
+            }
+            directory = entry.directory;
+            continue;
+        }
+
+        let known = tree.directories.iter().enumerate().find_map(|(id, item)| {
+            item.as_ref()
+                .filter(|item| item.info.identity == info.identity)
+                .map(|_| id as u32)
+        });
+        let child = if let Some(old) = known {
+            ensure!(
+                old != ROOT as u32 && old != directory,
+                "directory alias cycle"
+            );
+            let old_path = tree.path(old).ok();
+            let same_path = old_path.as_ref().is_some_and(|old| old == &path);
+            let still_linked = old_path
+                .as_ref()
+                .and_then(|old| fs::symlink_metadata(old).ok())
+                .is_some_and(|metadata| Info::from(&metadata).identity == info.identity);
+            ensure!(
+                same_path || !still_linked,
+                "targeted refresh path aliases another indexed directory"
+            );
+            if !same_path && let Some((parent, at)) = tree.directory_link(old) {
+                append(
+                    tree,
+                    journal,
+                    Event::Remove {
+                        directory: parent,
+                        entry: at as u32,
+                        child: old,
+                    },
+                )?;
+            }
+            old
+        } else {
+            tree.directories.len() as u32
+        };
+        let start = tree.dir(directory)?.count() as u32;
+        append(
+            tree,
+            journal,
+            Event::Entries {
+                directory,
+                chunk: Arc::new(Chunk {
+                    start,
+                    entries: vec![RawEntry {
+                        name: name.as_bytes().into(),
+                        info,
+                        directory: child,
+                        flags: 0,
+                    }]
+                    .into_boxed_slice(),
+                }),
+            },
+        )?;
+        directory = child;
+    }
+    Ok(directory)
+}
+
+fn propagate_file_info(
+    tree: &mut Tree,
+    journal: &mut Journal,
+    observed: &HashMap<Identity, Info>,
+) -> Result<()> {
+    let mut patches = Vec::new();
+    for (directory, active) in tree.active.iter().enumerate() {
+        if !active {
+            continue;
+        }
+        for (entry, item) in tree.dir(directory as u32)?.entries().enumerate() {
+            if item.info.kind == Kind::Directory {
+                continue;
+            }
+            if let Some(&info) = observed.get(&item.info.identity)
+                && info != item.info
+            {
+                patches.push((directory as u32, entry as u32, info, item.flags));
+            }
+        }
+    }
+    for (directory, entry, info, flags) in patches {
+        append(
+            tree,
+            journal,
+            Event::Patch {
+                directory,
+                entry,
+                info,
+                flags,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn excluded_filesystem(path: &Path, device: u64, known: &mut HashMap<u64, bool>) -> bool {
@@ -1223,18 +1581,19 @@ fn audit_files(
     options: &AuditOptions,
     counters: &mut Counters,
     progress: &Progress,
+    scope: u32,
 ) -> Result<estimate::Audit> {
     let mut population = Vec::new();
     let mut largest = BinaryHeap::new();
-    for (id, active) in tree.active.iter().enumerate() {
-        if !active {
-            continue;
-        }
-
-        let dir = tree.dir(id as u32)?;
+    let mut identities = HashSet::new();
+    for id in subtree_directories(tree, scope)? {
+        let dir = tree.dir(id)?;
         for (at, entry) in dir.entries().enumerate() {
-            if entry.directory == 0 && entry.flags & EXCLUDED == 0 && dir.counted[at] == 1 {
-                let key = (id as u32, at as u32);
+            if entry.directory == 0
+                && entry.flags & EXCLUDED == 0
+                && identities.insert(entry.info.identity)
+            {
+                let key = (id, at as u32);
                 population.push(key);
                 if options.priority > 0 {
                     largest.push(std::cmp::Reverse((entry.info.size, key)));
@@ -1246,11 +1605,13 @@ fn audit_files(
         }
     }
     let mut verified = HashSet::new();
+    let mut observed = HashMap::new();
     let mut valid = true;
     let refresh = |tree: &mut Tree,
                    journal: &mut Journal,
                    key: (u32, u32),
-                   counters: &mut Counters|
+                   counters: &mut Counters,
+                   observed: &mut HashMap<Identity, Info>|
      -> Result<bool> {
         let entry = tree
             .dir(key.0)?
@@ -1266,6 +1627,7 @@ fn audit_files(
                 if info.identity != entry.info.identity || info.kind != entry.info.kind {
                     return Ok(false);
                 }
+                observed.insert(info.identity, info);
                 if info != entry.info {
                     append(
                         tree,
@@ -1288,11 +1650,12 @@ fn audit_files(
             valid = false;
             break;
         }
-        valid &= refresh(tree, journal, key, counters)?;
+        valid &= refresh(tree, journal, key, counters, &mut observed)?;
         verified.insert(key);
     }
+    propagate_file_info(tree, journal, &observed)?;
     tree.aggregate()?;
-    let baseline = tree.dir(ROOT as u32)?.totals;
+    let baseline = tree.dir(scope)?.totals;
     let mut samples = Samples::default();
     let selected = rand::seq::index::sample(
         &mut rand::rng(),
@@ -1307,7 +1670,7 @@ fn audit_files(
         let key = population[at];
         let old = tree.dir(key.0)?.entry(key.1 as usize).unwrap().info;
         if !verified.contains(&key) {
-            valid &= refresh(tree, journal, key, counters)?;
+            valid &= refresh(tree, journal, key, counters, &mut observed)?;
             verified.insert(key);
         }
         let new = tree.dir(key.0)?.entry(key.1 as usize).unwrap().info;
@@ -1316,8 +1679,9 @@ fn audit_files(
             new.size as i128 - old.size as i128,
         );
     }
+    propagate_file_info(tree, journal, &observed)?;
     tree.aggregate()?;
-    let recorded = tree.dir(ROOT as u32)?.totals;
+    let recorded = tree.dir(scope)?.totals;
     progress
         .files
         .store(counters.files_statted, Ordering::Relaxed);
@@ -1330,4 +1694,16 @@ fn audit_files(
         options,
         valid && recorded.errors == 0,
     ))
+}
+
+fn subtree_directories(tree: &Tree, root: u32) -> Result<Vec<u32>> {
+    let mut directories = Vec::new();
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(directory) = pending.pop() {
+        ensure!(seen.insert(directory), "directory alias cycle");
+        directories.push(directory);
+        pending.extend(children(tree, directory));
+    }
+    Ok(directories)
 }

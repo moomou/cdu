@@ -1,5 +1,5 @@
 use crate::{
-    cache::Cache,
+    cache::{Cache, CacheLock},
     db::Store,
     fast::Tree,
     model::{Id, Kind},
@@ -9,7 +9,6 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -49,7 +48,7 @@ struct State {
 pub fn run(
     cache: &Cache,
     tree: &Tree,
-    lock: Arc<File>,
+    lock: Arc<CacheLock>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Progress>,
 ) -> Result<Outcome> {

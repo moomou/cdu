@@ -1,5 +1,5 @@
 use crate::{
-    cache::Cache,
+    cache::{Cache, CacheLock},
     model::{Entry, Id, Identity, Info, Kind, ROOT, Record, Report, Totals, display_name},
 };
 use anyhow::{Context, Result, ensure};
@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
     fmt::Write as _,
-    fs::File,
     os::unix::ffi::OsStrExt,
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -103,7 +102,7 @@ CREATE INDEX priority ON nodes(size DESC,id)
 
 pub(crate) struct Store {
     pub conn: Connection,
-    _lock: Arc<File>,
+    _lock: Arc<CacheLock>,
 }
 
 impl Store {
@@ -112,7 +111,7 @@ impl Store {
         Self::shared(cache, lock)
     }
 
-    pub(crate) fn shared(cache: &Cache, lock: Arc<File>) -> Result<Self> {
+    pub(crate) fn shared(cache: &Cache, lock: Arc<CacheLock>) -> Result<Self> {
         let conn = Connection::open_with_flags(
             &cache.database,
             OpenFlags::SQLITE_OPEN_READ_WRITE

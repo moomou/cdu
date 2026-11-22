@@ -166,6 +166,12 @@ metadata batches are recorded, and the application exits. On restart:
 - Changed directories are reconciled rather than blindly trusted.
 - A torn trailing record is ignored; the valid checkpoint prefix remains.
 
+While browsing, `r` and `R` refresh only the current directory subtree. A
+targeted refresh preempts an active root refresh, publishes the selected
+subtree first, then resumes the checkpointed root work. Stable directory IDs,
+parent links, and per-directory lookup signatures let the derived index update
+the changed subtree and affected ancestors without rebuilding every row.
+
 These are resumable metadata observations, not atomic filesystem snapshots.
 Changes made while the application is stopped still require validation.
 Directory timestamps cannot reveal all in-place file growth; the same
@@ -219,7 +225,7 @@ JSON is a directory snapshot, not an ncdu-compatible whole-tree export.
 | `e`, `t` | Toggle hidden entries / directories first |
 | `g`, `c` | Toggle size-share bars / counts |
 | `i`, `?` | Item details / help |
-| `r`, `R` | Incremental / full refresh; unfinished scans remain resumable |
+| `r`, `R` | Incremental / exact refresh of the current directory subtree |
 | `q`, Ctrl-C | Pause work and quit |
 | `d` | Delete only with `--enable-delete` and explicit confirmation |
 

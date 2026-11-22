@@ -17,8 +17,9 @@ use crossterm::{
 };
 use serde::Serialize;
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io::{self, Write},
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -73,15 +74,29 @@ pub struct Runtime {
 }
 
 struct Job {
+    scope: JobScope,
+    options: Options,
     progress: Arc<Progress>,
     index_progress: Arc<indexing::Progress>,
     index_cancel: Arc<AtomicBool>,
     preview: crossbeam_channel::Receiver<Arc<Tree>>,
-    ready_result: crossbeam_channel::Receiver<(Arc<Tree>, Report)>,
+    ready_result: crossbeam_channel::Receiver<Ready>,
     acknowledge: crossbeam_channel::Sender<()>,
     ready: bool,
     acknowledged: bool,
     thread: Option<JoinHandle<Result<indexing::Outcome>>>,
+}
+
+#[derive(Clone)]
+enum JobScope {
+    Main,
+    Target(PathBuf),
+}
+
+struct Ready {
+    tree: Arc<Tree>,
+    report: Report,
+    scope: Id,
 }
 
 impl Job {
@@ -91,6 +106,8 @@ impl Job {
         threads: usize,
         started: Instant,
         timings: Arc<Mutex<Timings>>,
+        scope: JobScope,
+        index_after_scan: bool,
     ) -> Self {
         let progress = Arc::new(Progress::default());
         let worker_progress = progress.clone();
@@ -101,28 +118,53 @@ impl Job {
         let (preview_tx, preview) = crossbeam_channel::unbounded();
         let (ready_tx, ready_result) = crossbeam_channel::bounded(1);
         let (acknowledge, ack) = crossbeam_channel::bounded(1);
+        let worker_scope = scope.clone();
+        let worker_options = options.clone();
         let thread = thread::spawn(move || {
-            let result = fast::scan(
-                cache.clone(),
-                &options,
-                threads,
-                worker_progress.clone(),
-                Some(preview_tx),
-            )?;
+            let result = match worker_scope {
+                JobScope::Main => fast::scan(
+                    cache.clone(),
+                    &worker_options,
+                    threads,
+                    worker_progress.clone(),
+                    Some(preview_tx),
+                )?,
+                JobScope::Target(path) => fast::scan_subtree(
+                    cache.clone(),
+                    &path,
+                    &worker_options,
+                    threads,
+                    worker_progress.clone(),
+                )?,
+            };
+            let fast::ScanResult {
+                tree,
+                report,
+                lock,
+                resumed,
+                scope,
+            } = result;
             {
                 let mut timing = timings.lock().unwrap();
                 if timing.full_size_interactive_us.is_none() {
                     timing.scan_complete_us = Some(started.elapsed().as_micros() as u64);
-                    timing.complete = result.report.complete && result.report.settled;
-                    timing.resumed_scan = result.resumed;
-                    timing.totals = Some(result.report.totals);
-                    timing.scan_counters = Some(result.report.counters.clone());
+                    timing.complete = report.complete && report.settled;
+                    timing.resumed_scan = resumed;
+                    timing.totals = Some(report.totals);
+                    timing.scan_counters = Some(report.counters.clone());
                 }
             }
             if worker_progress.cancel.load(Ordering::Relaxed) {
                 return Ok(indexing::Outcome::default());
             }
-            ready_tx.send((result.tree.clone(), result.report))?;
+            ready_tx.send(Ready {
+                tree: tree.clone(),
+                report,
+                scope,
+            })?;
+            if !index_after_scan {
+                return Ok(indexing::Outcome::default());
+            }
             loop {
                 if cancellation.load(Ordering::Relaxed) {
                     return Ok(indexing::Outcome::default());
@@ -133,13 +175,7 @@ impl Job {
             }
             timings.lock().unwrap().indexing_started_us =
                 Some(started.elapsed().as_micros() as u64);
-            let outcome = indexing::run(
-                &cache,
-                &result.tree,
-                result.lock,
-                cancellation,
-                worker_index,
-            )?;
+            let outcome = indexing::run(&cache, &tree, lock, cancellation, worker_index)?;
             {
                 let mut timing = timings.lock().unwrap();
                 timing.indexing_finished_us = Some(started.elapsed().as_micros() as u64);
@@ -148,6 +184,8 @@ impl Job {
             Ok(outcome)
         });
         Self {
+            scope,
+            options,
             progress,
             index_progress,
             index_cancel,
@@ -158,6 +196,10 @@ impl Job {
             acknowledged: false,
             thread: Some(thread),
         }
+    }
+
+    fn interrupted_main(&self) -> Option<Options> {
+        (matches!(&self.scope, JobScope::Main) && !self.ready).then(|| self.options.clone())
     }
 
     fn finished(&self) -> bool {
@@ -254,8 +296,11 @@ pub fn run(
             threads,
             started,
             timings.clone(),
+            JobScope::Main,
+            true,
         )
     });
+    let mut resume_main = None;
     let mut directory = ROOT;
     let mut selected = 0usize;
     let mut history = Vec::new();
@@ -281,39 +326,95 @@ pub fn run(
                     report.audit = None;
                     report
                 });
-                tree = Some(restored);
-                directory = ROOT;
-                selected = 0;
-                history.clear();
+                install_tree(
+                    &mut tree,
+                    snapshot.as_ref(),
+                    &mut directory,
+                    &mut selected,
+                    &mut history,
+                    restored,
+                    None,
+                );
                 redraw = true;
             }
-            if let Ok((ready, report)) = job.ready_result.try_recv() {
-                message = format!(
-                    "{} dirs checked, {} enumerated, {} files checked; full tree ready",
-                    report.counters.directories_checked,
-                    report.counters.directories_enumerated,
-                    report.counters.files_statted,
-                );
+            if let Ok(Ready {
+                tree: ready,
+                report,
+                scope,
+            }) = job.ready_result.try_recv()
+            {
+                let targeted = matches!(&job.scope, JobScope::Target(_));
+                let preferred_scope = match (&job.scope, snapshot.as_ref()) {
+                    (JobScope::Target(path), Some(snapshot))
+                        if path.as_os_str().as_bytes() == snapshot.path_bytes.as_slice() =>
+                    {
+                        Some(scope)
+                    }
+                    _ => None,
+                };
+                message = if targeted {
+                    if resume_main.is_some() {
+                        format!(
+                            "{} dirs checked, {} files checked; selected subtree ready, resuming root refresh",
+                            report.counters.directories_checked, report.counters.files_statted,
+                        )
+                    } else {
+                        format!(
+                            "{} dirs checked, {} files checked; selected subtree refreshed",
+                            report.counters.directories_checked, report.counters.files_statted,
+                        )
+                    }
+                } else {
+                    format!(
+                        "{} dirs checked, {} enumerated, {} files checked; full tree ready",
+                        report.counters.directories_checked,
+                        report.counters.directories_enumerated,
+                        report.counters.files_statted,
+                    )
+                };
                 live_report = Some(report);
-                tree = Some(ready);
-                directory = ROOT;
-                selected = 0;
-                history.clear();
+                install_tree(
+                    &mut tree,
+                    snapshot.as_ref(),
+                    &mut directory,
+                    &mut selected,
+                    &mut history,
+                    ready,
+                    preferred_scope,
+                );
                 help = false;
                 job.ready = true;
                 redraw = true;
             }
         }
         if job.as_ref().is_some_and(Job::finished) {
-            match job.take().unwrap().result() {
-                Ok(outcome) => {
-                    message = if outcome.complete {
-                        "Lookup index complete; browsing remains in memory.".to_owned()
-                    } else {
-                        "Lookup indexing paused; completed batches are saved.".to_owned()
-                    }
+            let finished = job.take().unwrap();
+            let targeted = matches!(&finished.scope, JobScope::Target(_));
+            let result = finished.result();
+            if targeted && let Some(options) = resume_main.take() {
+                if let Err(error) = &result {
+                    message = format!("Targeted refresh error: {error:#}; resuming root refresh.");
                 }
-                Err(error) => message = format!("Scan/index error: {error:#}"),
+                job = Some(Job::start(
+                    cache.clone(),
+                    options,
+                    threads,
+                    started,
+                    timings.clone(),
+                    JobScope::Main,
+                    true,
+                ));
+            } else {
+                match result {
+                    Ok(outcome) => {
+                        message = if outcome.complete {
+                            "Lookup index complete; browsing remains in memory.".to_owned()
+                        } else {
+                            "Lookup indexing paused; completed batches are saved.".to_owned()
+                        }
+                    }
+                    Err(error) => message = format!("Scan/index error: {error:#}"),
+                }
             }
             redraw = true;
         }
@@ -431,6 +532,12 @@ pub fn run(
         }
         if let Some(entry) = confirmation.take() {
             if key.code == KeyCode::Char('y') {
+                if resume_main.is_none() {
+                    resume_main = job.as_ref().and_then(Job::interrupted_main);
+                }
+                let refresh_path = snapshot
+                    .as_ref()
+                    .map(|snapshot| PathBuf::from(OsString::from_vec(snapshot.path_bytes.clone())));
                 drop(job.take());
                 let deletion = if let Some(tree) = &tree {
                     tree.delete(entry.id, entry.identity)
@@ -439,16 +546,44 @@ pub fn run(
                 };
                 match deletion {
                     Ok(()) => {
+                        if directory == ROOT {
+                            resume_main = None;
+                            job = Some(Job::start(
+                                cache.clone(),
+                                scan_options.clone(),
+                                threads,
+                                started,
+                                timings.clone(),
+                                JobScope::Main,
+                                true,
+                            ));
+                        } else if let Some(path) = refresh_path {
+                            let index_after_scan = resume_main.is_none();
+                            job = Some(Job::start(
+                                cache.clone(),
+                                scan_options.clone(),
+                                threads,
+                                started,
+                                timings.clone(),
+                                JobScope::Target(path),
+                                index_after_scan,
+                            ));
+                        }
+                        message = "Deleted; refreshing the current directory.".to_owned();
+                    }
+                    Err(error) => {
+                        message = format!("Delete refused: {error:#}");
+                        let options = resume_main.take().unwrap_or_else(|| scan_options.clone());
                         job = Some(Job::start(
                             cache.clone(),
-                            scan_options.clone(),
+                            options,
                             threads,
                             started,
                             timings.clone(),
+                            JobScope::Main,
+                            true,
                         ));
-                        message = "Deleted; refreshing metadata.".to_owned();
                     }
-                    Err(error) => message = format!("Delete refused: {error:#}"),
                 }
             }
             redraw = true;
@@ -526,17 +661,41 @@ pub fn run(
             KeyCode::Char('r' | 'R') if cached_only => {
                 message = "Cached-only mode: restart without --cached to refresh.".to_owned();
             }
-            KeyCode::Char('r' | 'R') if job.as_ref().is_none_or(|job| job.ready) => {
-                drop(job.take());
+            KeyCode::Char('r' | 'R') => {
                 let mut options = scan_options.clone();
                 options.exact = key.code == KeyCode::Char('R');
-                job = Some(Job::start(
-                    cache.clone(),
-                    options,
-                    threads,
-                    started,
-                    timings.clone(),
-                ));
+                if directory == ROOT {
+                    resume_main = None;
+                    drop(job.take());
+                    job = Some(Job::start(
+                        cache.clone(),
+                        options,
+                        threads,
+                        started,
+                        timings.clone(),
+                        JobScope::Main,
+                        true,
+                    ));
+                    message = "Refreshing the scan root.".to_owned();
+                } else if let Some(snapshot) = &snapshot {
+                    if resume_main.is_none() {
+                        resume_main = job.as_ref().and_then(Job::interrupted_main);
+                    }
+                    let path = PathBuf::from(OsString::from_vec(snapshot.path_bytes.clone()));
+                    let display = snapshot.path.clone();
+                    drop(job.take());
+                    let index_after_scan = resume_main.is_none();
+                    job = Some(Job::start(
+                        cache.clone(),
+                        options,
+                        threads,
+                        started,
+                        timings.clone(),
+                        JobScope::Target(path),
+                        index_after_scan,
+                    ));
+                    message = format!("Refreshing {display} only.");
+                }
             }
             KeyCode::Char('d') => {
                 if !enable_delete || cached_only {
@@ -584,6 +743,32 @@ pub fn run(
         output.write_all(b"\n")?;
     }
     Ok(())
+}
+
+fn install_tree(
+    current: &mut Option<Arc<Tree>>,
+    snapshot: Option<&Snapshot>,
+    directory: &mut Id,
+    selected: &mut usize,
+    history: &mut Vec<(Id, usize)>,
+    next: Arc<Tree>,
+    preferred: Option<Id>,
+) {
+    let previous_epoch = current.as_ref().map(|tree| tree.epoch);
+    let path =
+        snapshot.map(|snapshot| PathBuf::from(OsString::from_vec(snapshot.path_bytes.clone())));
+    let next_directory = preferred
+        .or_else(|| {
+            path.as_deref()
+                .and_then(|path| next.directory_at_path(path).ok())
+        })
+        .unwrap_or(ROOT);
+    if previous_epoch != Some(next.epoch) || next_directory != *directory {
+        history.clear();
+        *selected = 0;
+    }
+    *directory = next_directory;
+    *current = Some(next);
 }
 
 fn read_view(
@@ -660,7 +845,7 @@ fn draw(
             "s size sort   n name sort   C item-count sort (repeat to reverse)",
             "a apparent/allocated bytes   c counts   g graph   t directories first",
             "e hidden files   i selected item details",
-            "r incremental refresh   R full verification (returns to root)",
+            "r refresh current directory   R exact current-directory verification",
             "d delete (requires --enable-delete, then explicit y confirmation)",
             "? help   q quit / cancel active scan   Ctrl-C quit",
             "",
@@ -830,7 +1015,7 @@ fn draw(
             &mut buffer,
             height - 2,
             width,
-            " arrows/hjkl navigate | a size | s/n sort | r refresh | R exact | ? help | q quit",
+            " arrows/hjkl navigate | a size | s/n sort | r refresh here | R exact | ? help | q quit",
         )?;
     }
     let mut stdout = io::stdout().lock();

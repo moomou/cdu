@@ -18,6 +18,14 @@ pub struct Cache {
     pub one_file_system: bool,
 }
 
+pub struct CacheLock(File);
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl Cache {
     pub fn new(root: &Path, base: Option<&Path>, one_file_system: bool) -> Result<Self> {
         let root = fs::canonicalize(root).or_else(|_| std::path::absolute(root))?;
@@ -51,7 +59,7 @@ impl Cache {
         })
     }
 
-    pub(crate) fn lock(&self) -> Result<File> {
+    pub(crate) fn lock(&self) -> Result<CacheLock> {
         private_directory(&self.base)?;
         private_directory(&self.directory)?;
         let lock = OpenOptions::new()
@@ -65,7 +73,7 @@ impl Cache {
         lock.try_lock().context(
             "another cdu process is refreshing this cache; use --cached to browse its last committed index",
         )?;
-        Ok(lock)
+        Ok(CacheLock(lock))
     }
 }
 
@@ -85,4 +93,26 @@ fn private_directory(path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[test]
+    fn dropping_a_cache_lock_unlocks_inherited_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
+        let lock = cache.lock().unwrap();
+        let duplicate = unsafe { libc::fcntl(lock.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(duplicate >= 0);
+        let duplicate = unsafe { File::from_raw_fd(duplicate) };
+        drop(lock);
+        let reacquired = cache.lock().unwrap();
+        drop(reacquired);
+        drop(duplicate);
+    }
 }
