@@ -1,0 +1,17 @@
+/target
+__pycache__/
+*.py[cod]
+.env
+/core
+/core.*
+index.sqlite3
+index.sqlite3-wal
+index.sqlite3-shm
+lookup.sqlite3
+lookup.sqlite3-wal
+lookup.sqlite3-shm
+index.lock
+scan-[0-9]*.bin
+*.profraw
+*.profdata
+perf.data*
