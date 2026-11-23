@@ -158,6 +158,97 @@ fn targeted_refresh_can_preempt_and_then_resume_a_partial_exact_scan() {
 }
 
 #[test]
+fn recorded_errors_include_directory_failures_and_unreadable_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let blocked = root.join("blocked");
+    let unreadable = root.join("unreadable");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::write(&unreadable, b"data").unwrap();
+    let root_info = Info::from(&fs::symlink_metadata(&root).unwrap());
+    let blocked_info = Info::from(&fs::symlink_metadata(&blocked).unwrap());
+    let unreadable_info = Info::from(&fs::symlink_metadata(&unreadable).unwrap());
+    let mut tree = Tree::empty(root.clone());
+    tree.apply(
+        &Event::Start {
+            root: root.as_os_str().as_bytes().to_vec(),
+            info: root_info,
+        },
+        1,
+    )
+    .unwrap();
+    tree.apply(
+        &Event::Begin {
+            directory: ROOT as u32,
+            info: root_info,
+        },
+        2,
+    )
+    .unwrap();
+    tree.apply(
+        &Event::Entries {
+            directory: ROOT as u32,
+            chunk: Arc::new(Chunk {
+                start: 0,
+                entries: vec![
+                    RawEntry {
+                        name: b"blocked".as_slice().into(),
+                        info: blocked_info,
+                        directory: 2,
+                        flags: 0,
+                    },
+                    RawEntry {
+                        name: b"unreadable".as_slice().into(),
+                        info: unreadable_info,
+                        directory: 0,
+                        flags: UNREADABLE,
+                    },
+                ]
+                .into_boxed_slice(),
+            }),
+        },
+        3,
+    )
+    .unwrap();
+    tree.apply(
+        &Event::End {
+            directory: ROOT as u32,
+            info: root_info,
+            complete: true,
+            error: None,
+        },
+        4,
+    )
+    .unwrap();
+    tree.apply(
+        &Event::End {
+            directory: 2,
+            info: blocked_info,
+            complete: true,
+            error: Some("permission denied".to_owned()),
+        },
+        5,
+    )
+    .unwrap();
+    tree.aggregate().unwrap();
+
+    let errors = tree.recorded_errors().unwrap();
+    assert_eq!(errors.len(), 2);
+    assert!(errors[0].path.ends_with("/blocked"));
+    assert_eq!(errors[0].message, "permission denied");
+    assert!(errors[1].path.ends_with("/unreadable"));
+    assert_eq!(errors[1].message, "metadata could not be read");
+    let snapshot = tree.snapshot(ROOT, &ListOptions::default()).unwrap();
+    let blocked = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "blocked")
+        .unwrap();
+    assert_eq!(blocked.error.as_deref(), Some("permission denied"));
+    assert_eq!(snapshot.totals.errors, 2);
+}
+
+#[test]
 fn truncated_checkpoint_tail_keeps_the_committed_prefix() {
     use std::io::{Seek, SeekFrom, Write};
     let temp = tempfile::tempdir().unwrap();

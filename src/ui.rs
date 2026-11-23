@@ -1,9 +1,10 @@
 use crate::{
     ListOptions, Snapshot, Sort,
     cache::Cache,
+    db::read_errors,
     fast::{self, Tree},
     indexing,
-    model::{Entry, Id, Kind, ROOT, Report, display_name},
+    model::{Entry, Id, Kind, ROOT, RecordedError, Report, display_name},
     read_snapshot,
     scan::{Options, Progress, delete_entry},
 };
@@ -97,6 +98,35 @@ struct Ready {
     tree: Arc<Tree>,
     report: Report,
     scope: Id,
+}
+
+struct ErrorReview {
+    entries: Vec<RecordedError>,
+    selected: usize,
+}
+
+impl ErrorReview {
+    fn load(cache: &Cache, tree: Option<&Tree>) -> Result<Self> {
+        let entries = if let Some(tree) = tree {
+            tree.recorded_errors()?
+        } else {
+            read_errors(cache)?
+        };
+        Ok(Self {
+            entries,
+            selected: 0,
+        })
+    }
+
+    fn reload(&mut self, cache: &Cache, tree: Option<&Tree>) -> Result<()> {
+        self.entries = if let Some(tree) = tree {
+            tree.recorded_errors()?
+        } else {
+            read_errors(cache)?
+        };
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        Ok(())
+    }
 }
 
 impl Job {
@@ -305,6 +335,7 @@ pub fn run(
     let mut selected = 0usize;
     let mut history = Vec::new();
     let mut help = false;
+    let mut error_review: Option<ErrorReview> = None;
     let mut graph = true;
     let mut counts = false;
     let mut message = String::new();
@@ -335,6 +366,9 @@ pub fn run(
                     restored,
                     None,
                 );
+                if let Some(review) = &mut error_review {
+                    review.reload(&cache, tree.as_deref())?;
+                }
                 redraw = true;
             }
             if let Ok(Ready {
@@ -382,6 +416,9 @@ pub fn run(
                     ready,
                     preferred_scope,
                 );
+                if let Some(review) = &mut error_review {
+                    review.reload(&cache, tree.as_deref())?;
+                }
                 help = false;
                 job.ready = true;
                 redraw = true;
@@ -465,6 +502,7 @@ pub fn run(
                 &listing,
                 (width, height),
                 help,
+                error_review.as_ref(),
                 graph,
                 counts,
                 &message,
@@ -481,6 +519,7 @@ pub fn run(
                 &listing,
                 (width, height),
                 help,
+                error_review.as_ref(),
                 graph,
                 counts,
                 &message,
@@ -594,6 +633,46 @@ pub fn run(
             redraw = true;
             continue;
         }
+        if let Some(mut review) = error_review.take() {
+            let mut keep = true;
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Esc | KeyCode::Char('E') => keep = false,
+                KeyCode::Char('?') => {
+                    help = true;
+                    keep = false;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    review.selected =
+                        (review.selected + 1).min(review.entries.len().saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    review.selected = review.selected.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    review.selected =
+                        (review.selected + page).min(review.entries.len().saturating_sub(1));
+                }
+                KeyCode::PageUp => review.selected = review.selected.saturating_sub(page),
+                KeyCode::Home => review.selected = 0,
+                KeyCode::End => review.selected = review.entries.len().saturating_sub(1),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    if let Some(error) = review.entries.get(review.selected) {
+                        directory = error.directory;
+                        selected = 0;
+                        history.clear();
+                        message = format!("{}: {}", error.path, error.message);
+                    }
+                    keep = false;
+                }
+                _ => {}
+            }
+            if keep {
+                error_review = Some(review);
+            }
+            redraw = true;
+            continue;
+        }
         let children = snapshot.as_ref().map_or(0, |value| value.children);
         let current = snapshot
             .as_ref()
@@ -629,6 +708,13 @@ pub fn run(
                 }
             }
             KeyCode::Char('?') => help = true,
+            KeyCode::Char('E') => match ErrorReview::load(&cache, tree.as_deref()) {
+                Ok(review) => {
+                    message = format!("{} recorded errors.", review.entries.len());
+                    error_review = Some(review);
+                }
+                Err(error) => message = format!("Could not load recorded errors: {error:#}"),
+            },
             KeyCode::Char('a') => {
                 listing.apparent = !listing.apparent;
                 selected = 0;
@@ -791,6 +877,7 @@ fn draw(
     options: &ListOptions,
     (width, height): (u16, u16),
     help: bool,
+    error_review: Option<&ErrorReview>,
     graph: bool,
     counts: bool,
     message: &str,
@@ -837,14 +924,18 @@ fn draw(
         &mut buffer,
         1,
         width,
-        snapshot.map_or("Building the first metadata index...", |s| s.path.as_str()),
+        if error_review.is_some() {
+            "Recorded filesystem errors"
+        } else {
+            snapshot.map_or("Building the first metadata index...", |s| s.path.as_str())
+        },
     )?;
     if help {
         let lines = [
             "Navigation: arrows / hjkl, Enter, Backspace, PgUp/PgDn, Home/End",
             "s size sort   n name sort   C item-count sort (repeat to reverse)",
             "a apparent/allocated bytes   c counts   g graph   t directories first",
-            "e hidden files   i selected item details",
+            "e hidden files   i selected item details   E review errors",
             "r refresh current directory   R exact current-directory verification",
             "d delete (requires --enable-delete, then explicit y confirmation)",
             "? help   q quit / cancel active scan   Ctrl-C quit",
@@ -863,6 +954,46 @@ fn draw(
         {
             line(&mut buffer, index as u16 + 3, width, text)?;
         }
+    } else if let Some(review) = error_review {
+        line(
+            &mut buffer,
+            2,
+            width,
+            &format!(" {} recorded errors", review.entries.len()),
+        )?;
+        let page = usize::from(height - 7).max(1);
+        let offset = review.selected / page * page;
+        if review.entries.is_empty() {
+            line(
+                &mut buffer,
+                3,
+                width,
+                "No filesystem errors are recorded in the current index.",
+            )?;
+        } else {
+            for (index, error) in review.entries.iter().skip(offset).take(page).enumerate() {
+                let active = offset + index == review.selected;
+                if active {
+                    queue!(buffer, SetAttribute(Attribute::Reverse))?;
+                }
+                let message = display_name(OsStr::new(&error.message));
+                line(
+                    &mut buffer,
+                    index as u16 + 3,
+                    width,
+                    &format!("! {} | {message}", error.path),
+                )?;
+                if active {
+                    queue!(buffer, SetAttribute(Attribute::Reset))?;
+                }
+            }
+        }
+        line(
+            &mut buffer,
+            height - 4,
+            width,
+            "Recorded paths and messages from the current metadata index.",
+        )?;
     } else if let Some(snapshot) = snapshot {
         let metric = |entry: &Entry| {
             if options.apparent {
@@ -993,7 +1124,20 @@ fn draw(
         )?;
     }
     if !help {
-        if let Some(entry) = confirmation {
+        if let Some(review) = error_review {
+            let detail = review
+                .entries
+                .get(review.selected)
+                .map(|error| {
+                    format!(
+                        "{} | {}",
+                        error.path,
+                        display_name(OsStr::new(&error.message))
+                    )
+                })
+                .unwrap_or_else(|| "No recorded errors.".to_owned());
+            line(&mut buffer, height - 3, width, &detail)?;
+        } else if let Some(entry) = confirmation {
             line(
                 &mut buffer,
                 height - 3,
@@ -1015,7 +1159,11 @@ fn draw(
             &mut buffer,
             height - 2,
             width,
-            " arrows/hjkl navigate | a size | s/n sort | r refresh here | R exact | ? help | q quit",
+            if error_review.is_some() {
+                " j/k navigate | Enter open directory | E/Esc close | ? help | q quit"
+            } else {
+                " arrows/hjkl navigate | E errors | r refresh here | R exact | ? help | q quit"
+            },
         )?;
     }
     let mut stdout = io::stdout().lock();

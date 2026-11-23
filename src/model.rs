@@ -206,6 +206,13 @@ pub struct Entry {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedError {
+    pub path: String,
+    pub directory: Id,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Counters {
     pub directories_checked: u64,

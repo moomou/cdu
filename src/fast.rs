@@ -4,8 +4,8 @@ use crate::{
     estimate::{self, AuditOptions, Samples},
     journal::{self, Journal},
     model::{
-        Counters, Delta, Entry, Id, Identity, Info, Kind, ROOT, Record, Report, Totals,
-        display_name,
+        Counters, Delta, Entry, Id, Identity, Info, Kind, ROOT, Record, RecordedError, Report,
+        Totals, display_name,
     },
     scan::{Options as ScanOptions, Progress},
 };
@@ -335,6 +335,48 @@ impl Tree {
         Ok(directory as Id)
     }
 
+    pub(crate) fn recorded_errors(&self) -> Result<Vec<RecordedError>> {
+        let mut errors = Vec::new();
+        for (id, active) in self.active.iter().enumerate() {
+            if !active {
+                continue;
+            }
+            let id = id as u32;
+            let directory = self.dir(id)?;
+            let path = self.path(id)?;
+            if let Some(message) = &directory.error {
+                errors.push((
+                    path.as_os_str().as_bytes().to_vec(),
+                    RecordedError {
+                        path: display_name(path.as_os_str()),
+                        directory: if directory.parent == 0 {
+                            ROOT
+                        } else {
+                            directory.parent as Id
+                        },
+                        message: message.clone(),
+                    },
+                ));
+            }
+            for entry in directory.entries() {
+                if entry.flags & UNREADABLE == 0 {
+                    continue;
+                }
+                let path = path.join(OsStr::from_bytes(&entry.name));
+                errors.push((
+                    path.as_os_str().as_bytes().to_vec(),
+                    RecordedError {
+                        path: display_name(path.as_os_str()),
+                        directory: id as Id,
+                        message: "metadata could not be read".to_owned(),
+                    },
+                ));
+            }
+        }
+        errors.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(errors.into_iter().map(|(_, error)| error).collect())
+    }
+
     fn directory_link(&self, child: u32) -> Option<(u32, usize)> {
         let parent = self.dir(child).ok()?.parent;
         self.dir(parent)
@@ -513,6 +555,13 @@ impl Tree {
     fn entry_view(&self, parent: u32, at: usize) -> Entry {
         let dir = self.dir(parent).unwrap();
         let entry = dir.entry(at).unwrap();
+        let error = if entry.directory != 0 {
+            self.dir(entry.directory)
+                .ok()
+                .and_then(|directory| directory.error.clone())
+        } else {
+            (entry.flags & UNREADABLE != 0).then(|| "metadata could not be read".to_owned())
+        };
         Entry {
             id: if entry.directory != 0 {
                 entry.directory as Id
@@ -529,7 +578,7 @@ impl Tree {
                 && dir.counted.get(at) != Some(&1),
             excluded: (entry.flags & EXCLUDED != 0)
                 .then(|| "excluded filesystem, cache, or directory alias".to_owned()),
-            error: (entry.flags & UNREADABLE != 0).then(|| "metadata could not be read".to_owned()),
+            error,
         }
     }
     pub(crate) fn directory_record(&self, id: u32) -> Result<Record> {

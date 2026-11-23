@@ -68,6 +68,30 @@ class Terminal:
 
 
 class TerminalTests(unittest.TestCase):
+    @unittest.skipIf(os.geteuid() == 0, "root can read mode-000 directories")
+    def test_recorded_errors_can_be_reviewed_and_opened(self):
+        with tempfile.TemporaryDirectory(prefix="cdu-errors-") as temp:
+            root = pathlib.Path(temp) / "tree"
+            cache = pathlib.Path(temp) / "cache"
+            blocked = root / "blocked"
+            blocked.mkdir(parents=True)
+            blocked.chmod(0)
+            terminal = Terminal(root, cache)
+            try:
+                terminal.wait_for(b"1 errors")
+                terminal.wait_for(b"[incomplete]")
+                start = terminal.send(b"E")
+                terminal.wait_for(b"Recorded filesystem errors", start)
+                terminal.wait_for(str(blocked).encode(), start)
+                terminal.wait_for(b"Permission denied", start)
+                start = terminal.send(b"\r")
+                terminal.wait_for(str(root).encode(), start)
+                terminal.wait_for(b"Permission denied", start)
+                terminal.quit()
+            finally:
+                blocked.chmod(0o700)
+                terminal.close()
+
     def test_navigation_help_controls_and_quit(self):
         with tempfile.TemporaryDirectory(prefix="cdu-ui-") as temp:
             root = pathlib.Path(temp) / "tree"

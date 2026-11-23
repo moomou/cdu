@@ -225,6 +225,7 @@ JSON is a directory snapshot, not an ncdu-compatible whole-tree export.
 | `e`, `t` | Toggle hidden entries / directories first |
 | `g`, `c` | Toggle size-share bars / counts |
 | `i`, `?` | Item details / help |
+| `E` | Review all filesystem errors recorded in the current index |
 | `r`, `R` | Incremental / exact refresh of the current directory subtree |
 | `q`, Ctrl-C | Pause work and quit |
 | `d` | Delete only with `--enable-delete` and explicit confirmation |
@@ -233,6 +234,12 @@ Live scan counts and size estimates remain visible while discovering the tree.
 Initial sizes are labeled **partial**, not presented as the complete answer.
 After discovery, the full-size browser stays available while indexing proceeds.
 Bars use the current directory's recorded total, not the current screenful.
+
+The error count in the header is actionable: press `E` to review recorded paths
+and messages, then press Enter to open the containing directory. Directory
+failures preserve their scan error text; entries whose metadata could not be
+read are listed with that generic status. A successful later refresh removes
+resolved errors from the review.
 
 The browser is read-only by default. Deletion checks identity and metadata but
 is not an atomic transaction against concurrent filesystem writers. The scan

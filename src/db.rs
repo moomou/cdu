@@ -1,6 +1,8 @@
 use crate::{
     cache::{Cache, CacheLock},
-    model::{Entry, Id, Identity, Info, Kind, ROOT, Record, Report, Totals, display_name},
+    model::{
+        Entry, Id, Identity, Info, Kind, ROOT, Record, RecordedError, Report, Totals, display_name,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{
@@ -566,6 +568,41 @@ pub fn read_snapshot(cache: &Cache, directory: Id, options: &ListOptions) -> Res
     })
 }
 
+pub(crate) fn read_errors(cache: &Cache) -> Result<Vec<RecordedError>> {
+    let conn = Connection::open_with_flags(
+        &cache.database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .context("no readable index; run cdu without --cached first")?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.execute_batch("BEGIN")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    ensure!(
+        version == 2,
+        "unsupported cache format; run without --cached to upgrade an older index"
+    );
+    let rows: Vec<(Id, Option<Id>, String)> = conn
+        .prepare("SELECT id,parent,error FROM nodes WHERE error IS NOT NULL")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut errors = Vec::with_capacity(rows.len());
+    for (id, parent, message) in rows {
+        let path = indexed_path(&conn, cache, id)?;
+        errors.push((
+            path.as_os_str().as_bytes().to_vec(),
+            RecordedError {
+                path: display_name(path.as_os_str()),
+                directory: parent.unwrap_or(ROOT),
+                message,
+            },
+        ));
+    }
+    errors.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(errors.into_iter().map(|(_, error)| error).collect())
+}
+
 pub(crate) fn indexed_path(conn: &Connection, cache: &Cache, mut id: Id) -> Result<PathBuf> {
     let mut parts = Vec::new();
     let mut statement = conn.prepare_cached("SELECT parent,name FROM nodes WHERE id=?1")?;
@@ -589,4 +626,67 @@ pub(crate) fn indexed_path(conn: &Connection, cache: &Cache, mut id: Id) -> Resu
         path.push(OsStr::from_bytes(&part));
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn persisted_errors_include_paths_and_containing_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("blocked"), b"data").unwrap();
+        let cache = Cache::new(&root, Some(&temp.path().join("cache")), false).unwrap();
+        let store = Store::open(&cache).unwrap();
+        let root_info = Info::from(&fs::symlink_metadata(&root).unwrap());
+        let blocked_info = Info::from(&fs::symlink_metadata(root.join("blocked")).unwrap());
+        store
+            .insert(&Record {
+                id: ROOT,
+                parent: None,
+                name: Vec::new(),
+                info: root_info,
+                counted: true,
+                excluded: None,
+                error: None,
+                totals: Totals {
+                    disk_bytes: root_info.disk() + blocked_info.disk(),
+                    apparent_bytes: root_info.size + blocked_info.size,
+                    entries: 2,
+                    errors: 1,
+                    excluded: 0,
+                },
+                direct_children: 1,
+            })
+            .unwrap();
+        store
+            .insert(&Record {
+                id: 2,
+                parent: Some(ROOT),
+                name: b"blocked".to_vec(),
+                info: blocked_info,
+                counted: true,
+                excluded: None,
+                error: Some("permission denied".to_owned()),
+                totals: Totals {
+                    disk_bytes: blocked_info.disk(),
+                    apparent_bytes: blocked_info.size,
+                    entries: 1,
+                    errors: 1,
+                    excluded: 0,
+                },
+                direct_children: 0,
+            })
+            .unwrap();
+        drop(store);
+
+        let errors = read_errors(&cache).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].path.ends_with("/blocked"));
+        assert_eq!(errors[0].directory, ROOT);
+        assert_eq!(errors[0].message, "permission denied");
+    }
 }
